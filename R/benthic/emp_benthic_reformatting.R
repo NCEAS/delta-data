@@ -1,5 +1,6 @@
 library(purrr)
 library(dplyr)
+library(tidyr)
 library(lubridate)
 
 #' Reformat EMP benthic data from wide to long format
