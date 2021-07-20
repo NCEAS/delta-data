@@ -1,0 +1,188 @@
+---
+title: "Benthic Reformatting"
+author: "Jeanette Clark"
+date: "7/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+This doc checks the excel file sent by Betsy Wells for potential QA issues.
+
+```{r, message = FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(janitor)
+library(sf)
+library(ggmap)
+```
+
+Reformat the main sheet from wide to long.
+
+```{r, warning = FALSE, message = FALSE}
+d <- read_excel(
+        "../../data/benthic/1975-Oct2020 DWR EMP Benthic CPUE 20210511.xlsx",
+        skip = 7,
+        col_names = T,
+        .name_repair = 'minimal')
+
+# find columns to not pivot over
+fixed_cols <-
+    grep("[0-9]", colnames(d), value = TRUE, invert = TRUE)
+
+# read in just the first 6 rows with taxa info
+h <- read_excel(
+        "../../data/benthic/1975-Oct2020 DWR EMP Benthic CPUE 20210511.xlsx",
+        skip = 1,
+        n_max = 7,
+        col_names = F
+    )
+
+# paste all taxa together
+col_n <- map_chr(h, paste, collapse = "|")
+
+# replace appropriate column names in main data frame with pasted taxa info
+col_n[grep("^NA|NA|NA", col_n)] <- NA
+col_d <- colnames(d)
+col_d[grep("[0-9]", col_d)] <- col_n[!is.na(col_n)]
+colnames(d) <- col_d
+
+
+# move from wide to long and split taxa info back into columns
+cpue <- d %>% pivot_longer(
+        cols = -all_of(fixed_cols),
+        names_to = c(
+            "phylum",
+            "class",
+            "order",
+            "family",
+            "genus",
+            "species",
+            "id_no"),
+        values_to = "count",
+        names_sep = "\\|") %>%
+    mutate_all(as.character) %>% 
+    clean_names() %>% 
+    unite(species, genus, species, sep = " ") %>% 
+    mutate(count = as.numeric(count),
+           year = as.numeric(year))
+```
+
+```{r}
+stations <- read_excel("../../data/benthic/1975-Oct2020 DWR EMP Benthic CPUE 20210511.xlsx", sheet = 2) %>% 
+    clean_names() %>% 
+    rename(station_code = site_code)
+```
+
+Check to make sure all counts have station information
+
+```{r}
+nrow(anti_join(cpue, stations, by = "station_code"))
+```
+
+Get total site visits per year
+
+```{r}
+visits <- read_excel("../../data/benthic/1975-Oct2020 DWR EMP Benthic CPUE 20210511.xlsx", sheet = 4) %>% 
+    rename(station_code = `Row Labels`) %>% 
+    pivot_longer(-station_code, names_to = "year", values_to = "visits") %>% 
+    filter(station_code != "Grand Total" & year != "Grand Total") %>% 
+    mutate(year = as.numeric(year)) %>% 
+    arrange(station_code, year)
+```
+
+Get total grabs per year
+
+```{r}
+grabs <- read_excel("../../data/benthic/1975-Oct2020 DWR EMP Benthic CPUE 20210511.xlsx", sheet = 5) %>% 
+    rename(station_code = `Row Labels`) %>% 
+    pivot_longer(-station_code, names_to = "year", values_to = "grabs") %>% 
+    filter(station_code != "Grand Total" & year != "Grand Total") %>% 
+    mutate(year = as.numeric(year)) %>% 
+    arrange(station_code, year)
+```
+
+Check to make sure visits and grabs have valid station information.
+
+```{r}
+g_j <- anti_join(grabs, stations, by = "station_code")
+v_j <- anti_join(visits, stations, by = "station_code")
+
+nrow(g_j)
+nrow(v_j)
+```
+
+# Check the invasive species data
+
+```{r}
+inv <- cpue %>% 
+    filter(species %in% c("Potamocorbula amurensis", "Corbicula fluminea"))
+```
+
+```{r}
+ggplot(inv, aes(x = year, y = count, color = species)) +
+    geom_point() +
+    theme_classic()
+```
+
+# Map mean invasives at each study location
+
+```{r}
+inv_mean <- inv %>% 
+    group_by(station_code, species) %>% 
+    summarise(count = mean(count), .groups = "drop") %>% 
+    left_join(stations, by = "station_code") %>% 
+    st_as_sf(coords = c('longitude', 'latitude'),
+             crs = 4326)
+```
+
+Get ggmap basemap
+
+```{r, message = FALSE}
+# Define a function to fix the bbox to be in EPSG:3857
+# See https://github.com/dkahle/ggmap/issues/160#issuecomment-397055208
+ggmap_bbox_to_3857 <- function(map) {
+  if (!inherits(map, "ggmap")) stop("map must be a ggmap object")
+  # Extract the bounding box (in lat/lon) from the ggmap to a numeric vector, 
+  # and set the names to what sf::st_bbox expects:
+  map_bbox <- setNames(unlist(attr(map, "bb")), 
+                       c("ymin", "xmin", "ymax", "xmax"))
+  
+  # Coonvert the bbox to an sf polygon, transform it to 3857, 
+  # and convert back to a bbox (convoluted, but it works)
+  bbox_3857 <- st_bbox(st_transform(st_as_sfc(st_bbox(map_bbox, crs = 4326)), 3857))
+  
+  # Overwrite the bbox of the ggmap object with the transformed coordinates 
+  attr(map, "bb")$ll.lat <- bbox_3857["ymin"]
+  attr(map, "bb")$ll.lon <- bbox_3857["xmin"]
+  attr(map, "bb")$ur.lat <- bbox_3857["ymax"]
+  attr(map, "bb")$ur.lon <- bbox_3857["xmax"]
+  map
+}
+
+bbox <- c(-122.25, 37.78, -121.31, 38.35)   # This is roughly southern Alaska
+basemap <- get_stamenmap(bbox, zoom = 10)
+basemap_3857 <- ggmap_bbox_to_3857(basemap)
+```
+
+
+```{r, message = FALSE}
+inv_mean_3857 <- st_transform(inv_mean, crs = 3857)
+
+ggmap(basemap_3857) +
+    geom_sf(data = inv_mean_3857,
+            aes(color = species, size = count),
+            inherit.aes = FALSE,
+            shape = 21,
+            stroke = 1) +
+    scale_size(range = c(0.5, 12)) +
+    scale_color_manual(values = c("#fc8d62", "#377eb8")) +
+    labs(x = "", y = "")
+```
+
